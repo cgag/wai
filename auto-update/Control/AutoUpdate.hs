@@ -27,7 +27,7 @@ import           Control.AutoUpdate.Util (atomicModifyIORef')
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Exception  (assert, finally)
 import           Control.Monad      (void, when)
-import           Data.IORef         (IORef, newIORef, writeIORef)
+import           Data.IORef         (IORef, newIORef, writeIORef, readIORef)
 import           Control.Concurrent.STM
 
 -- | Default value for creating an @UpdateSettings@.
@@ -73,74 +73,72 @@ data UpdateSettings a = UpdateSettings
     -- Since 0.1.0
     }
 
-data Status a = AutoUpdated
-                    (TMVar a)
-                    {-# UNPACK #-} !Int
-                    -- Number of times used since last updated.
-                    !a
-              | Spawning (TMVar a)
-              | ManualUpdates
-                    (TMVar a)
-                    {-# UNPACK #-} !Int
-                    -- Number of times used since we started/switched
-                    -- off manual updates.
+data Status = Auto | Spawning | Manual
+data Action = Exec | Spawn | Wait | Return
 
 -- | Generate an action which will either read from an automatically
 -- updated value, or run the update action in the current thread.
 --
 -- Since 0.1.0
 mkAutoUpdate :: UpdateSettings a -> IO (IO a)
-mkAutoUpdate us = do
+mkAutoUpdate settings = do
     var <- atomically newEmptyTMVar
-    istatus <- newIORef $ ManualUpdates var 0
-    return $! getCurrent us istatus
-
-data Action a = Manual | Spawn (TMVar a) | Wait (TMVar a) | Return a
+    stateref <- newIORef Manual
+    cntref <- newIORef 0
+    return $! getCurrent settings var stateref cntref
 
 -- | Get the current value, either fed from an auto-update thread, or
 -- computed manually in the current thread.
 --
 -- Since 0.1.0
 getCurrent :: UpdateSettings a
-           -> IORef (Status a) -- ^ mutable state
+           -> TMVar a
+           -> IORef Status
+           -> IORef Int
            -> IO a
-getCurrent settings@UpdateSettings{..} istatus =
-    atomicModifyIORef' istatus change >>= switch
+getCurrent settings@UpdateSettings{..} var stateref cntref = do
+    cnt <- readIORef cntref
+    act <- atomicModifyIORef' stateref $ change cnt
+    switch act
   where
-    change (ManualUpdates var cnt)
-      | cnt < updateSpawnThreshold   = (ManualUpdates var (cnt + 1), Manual)
-      | otherwise                    = (Spawning var, Spawn var)
-    change (Spawning var)            = (Spawning var, Wait var)
-    change (AutoUpdated var cnt cur) = (AutoUpdated var (cnt + 1) cur, Return cur)
+    change cnt Manual
+      | cnt < updateSpawnThreshold = (Manual, Exec)
+      | otherwise                  = (Spawning, Spawn)
+    change _   Spawning            = (Spawning, Wait)
+    change _   Auto                = (Auto, Return)
 
-    switch Manual       = updateAction
-    switch (Spawn var)  = do
+    switch Exec = do
+        atomicModifyIORef' cntref $ \i -> (i + 1, ())
+        updateAction
+    switch Spawn = do
         new <- updateAction
         atomically $ putTMVar var new
-        writeIORef istatus (AutoUpdated var 0 new)
-        void . forkIO $ spawn settings istatus
+        writeIORef stateref Auto
+        writeIORef cntref 0
+        void . forkIO $ spawn settings var stateref cntref
         return new
-    switch (Wait var)   = atomically $ readTMVar var
-    switch (Return cur) = return cur
+    switch Wait = atomically $ readTMVar var
+    switch Return = do
+        atomicModifyIORef' cntref $ \i -> (i + 1, ())
+        atomically $ readTMVar var
 
-spawn :: UpdateSettings a -> IORef (Status a) -> IO ()
-spawn UpdateSettings{..} istatus = loop `finally` cleanup
+spawn :: UpdateSettings a
+      -> TMVar a
+      -> IORef Status
+      -> IORef Int
+      -> IO ()
+spawn UpdateSettings{..} var stateref cntref = loop `finally` cleanup
   where
     loop = do
         threadDelay updateFreq
-        new <- updateAction
-        var <- atomically newEmptyTMVar -- FIXME: this is wasteful.
-        again <- atomicModifyIORef' istatus $ change var new
+        cnt <- readIORef cntref
+        again <- atomicModifyIORef' stateref $ change cnt
         when again loop
 
-    -- Normal case.
-    change var new (AutoUpdated oldvar cnt _old)
-      | cnt >= 1                     = (AutoUpdated oldvar 0 new, True)
-      | otherwise                    = (ManualUpdates var 0, False)
-    -- This case must not happen.
-    change _ _ (ManualUpdates cnt oldvar) = assert False (ManualUpdates cnt oldvar, False)
-    change var _ (Spawning _)             = assert False (ManualUpdates var 0, False)
+    change cnt Auto | cnt >= 1 = (Auto, True)
+    change _ _                 = (Manual, False)
 
     cleanup = do
-        var <- atomically newEmptyTMVar
-        writeIORef istatus $ ManualUpdates var 0
+        void . atomically $ tryTakeTMVar var
+        writeIORef stateref Manual
+        writeIORef cntref 0
