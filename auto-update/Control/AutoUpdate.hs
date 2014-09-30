@@ -27,7 +27,7 @@ import           Control.AutoUpdate.Util (atomicModifyIORef')
 import           Control.Concurrent (forkIO, threadDelay)
 import           Control.Exception  (assert, finally)
 import           Control.Monad      (void, when)
-import           Data.IORef         (IORef, newIORef)
+import           Data.IORef         (IORef, newIORef, writeIORef)
 import           Control.Concurrent.STM
 
 -- | Default value for creating an @UpdateSettings@.
@@ -117,7 +117,7 @@ getCurrent settings@UpdateSettings{..} istatus =
     switch (Spawn var)  = do
         new <- updateAction
         atomically $ putTMVar var new
-        atomicModifyIORef' istatus $ \_ -> (AutoUpdated var 0 new, ())
+        writeIORef istatus (AutoUpdated var 0 new)
         void . forkIO $ spawn settings istatus
         return new
     switch (Wait var)   = atomically $ readTMVar var
@@ -143,4 +143,4 @@ spawn UpdateSettings{..} istatus = loop `finally` cleanup
 
     cleanup = do
         var <- atomically newEmptyTMVar
-        atomicModifyIORef' istatus $ \_ -> (ManualUpdates var 0, ())
+        writeIORef istatus $ ManualUpdates var 0
