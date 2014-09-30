@@ -73,17 +73,12 @@ data UpdateSettings a = UpdateSettings
     -- Since 0.1.0
     }
 
-data Status a = AutoUpdated
-                    (TMVar a)
-                    {-# UNPACK #-} !Int
-                    -- Number of times used since last updated.
-                    !a
-              | Spawning (TMVar a)
-              | ManualUpdates
-                    (TMVar a)
-                    {-# UNPACK #-} !Int
-                    -- Number of times used since we started/switched
-                    -- off manual updates.
+data Status a = Manual (TMVar a) {-# UNPACK #-} !Int
+                -- Int: Number of times used since we started/switched
+                -- off manual updates.
+              | Semi (TMVar a)
+              | Auto (TMVar a) {-# UNPACK #-} !Int !a
+                -- Int: Number of times used since last updated.
 
 -- | Generate an action which will either read from an automatically
 -- updated value, or run the update action in the current thread.
@@ -92,10 +87,10 @@ data Status a = AutoUpdated
 mkAutoUpdate :: UpdateSettings a -> IO (IO a)
 mkAutoUpdate us = do
     var <- atomically newEmptyTMVar
-    istatus <- newIORef $ ManualUpdates var 0
+    istatus <- newIORef $ Manual var 0
     return $! getCurrent us istatus
 
-data Action a = Manual | Spawn (TMVar a) | Wait (TMVar a) | Return a
+data Action a = Perform | Spawn (TMVar a) | Wait (TMVar a) | Return a
 
 -- | Get the current value, either fed from an auto-update thread, or
 -- computed manually in the current thread.
@@ -107,17 +102,17 @@ getCurrent :: UpdateSettings a
 getCurrent settings@UpdateSettings{..} istatus =
     atomicModifyIORef' istatus change >>= switch
   where
-    change (ManualUpdates var cnt)
-      | cnt < updateSpawnThreshold   = (ManualUpdates var (cnt + 1), Manual)
-      | otherwise                    = (Spawning var, Spawn var)
-    change (Spawning var)            = (Spawning var, Wait var)
-    change (AutoUpdated var cnt cur) = (AutoUpdated var (cnt + 1) cur, Return cur)
+    change (Manual var cnt)
+      | cnt < updateSpawnThreshold = (Manual var (cnt + 1), Perform)
+      | otherwise                  = (Semi var, Spawn var)
+    change (Semi var)              = (Semi var, Wait var)
+    change (Auto var cnt cur)      = (Auto var (cnt + 1) cur, Return cur)
 
-    switch Manual       = updateAction
+    switch Perform      = updateAction
     switch (Spawn var)  = do
         new <- updateAction
         atomically $ putTMVar var new
-        writeIORef istatus (AutoUpdated var 0 new)
+        writeIORef istatus (Auto var 0 new)
         void . forkIO $ spawn settings istatus
         return new
     switch (Wait var)   = atomically $ readTMVar var
@@ -134,13 +129,13 @@ spawn UpdateSettings{..} istatus = loop `finally` cleanup
         when again loop
 
     -- Normal case.
-    change var new (AutoUpdated oldvar cnt _old)
-      | cnt >= 1                     = (AutoUpdated oldvar 0 new, True)
-      | otherwise                    = (ManualUpdates var 0, False)
+    change var new (Auto oldvar cnt _old)
+      | cnt >= 1                   = (Auto oldvar 0 new, True)
+      | otherwise                  = (Manual var 0, False)
     -- This case must not happen.
-    change _ _ (ManualUpdates cnt oldvar) = assert False (ManualUpdates cnt oldvar, False)
-    change var _ (Spawning _)             = assert False (ManualUpdates var 0, False)
+    change _ _ (Manual cnt oldvar) = assert False (Manual cnt oldvar, False)
+    change var _ (Semi _)          = assert False (Manual var 0, False)
 
     cleanup = do
         var <- atomically newEmptyTMVar
-        writeIORef istatus $ ManualUpdates var 0
+        writeIORef istatus $ Manual var 0
