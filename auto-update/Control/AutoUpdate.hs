@@ -24,12 +24,11 @@ module Control.AutoUpdate (
     ) where
 
 import           Control.AutoUpdate.Util (atomicModifyIORef')
-import           Control.Concurrent (ThreadId, forkIO, myThreadId, threadDelay)
-import           Control.Exception  (Exception, SomeException
-                                    ,assert, fromException, handle,throwIO, throwTo)
-import           Control.Monad      (forever, join)
+import           Control.Concurrent (forkIO, threadDelay)
+import           Control.Exception  (assert, finally)
+import           Control.Monad      (void, when)
 import           Data.IORef         (IORef, newIORef)
-import           Data.Typeable      (Typeable)
+import           Control.Concurrent.STM
 
 -- | Default value for creating an @UpdateSettings@.
 --
@@ -75,12 +74,13 @@ data UpdateSettings a = UpdateSettings
     }
 
 data Status a = AutoUpdated
-                    !a
+                    (TMVar a)
                     {-# UNPACK #-} !Int
                     -- Number of times used since last updated.
-                    {-# UNPACK #-} !ThreadId
-                    -- Worker thread.
+                    !a
+              | Spawning (TMVar a)
               | ManualUpdates
+                    (TMVar a)
                     {-# UNPACK #-} !Int
                     -- Number of times used since we started/switched
                     -- off manual updates.
@@ -91,13 +91,11 @@ data Status a = AutoUpdated
 -- Since 0.1.0
 mkAutoUpdate :: UpdateSettings a -> IO (IO a)
 mkAutoUpdate us = do
-    istatus <- newIORef $ ManualUpdates 0
+    var <- atomically newEmptyTMVar
+    istatus <- newIORef $ ManualUpdates var 0
     return $! getCurrent us istatus
 
-data Action a = Return a | Manual | Spawn
-
-data Replaced = Replaced deriving (Show, Typeable)
-instance Exception Replaced
+data Action a = Manual | Spawn (TMVar a) | Wait (TMVar a) | Return a
 
 -- | Get the current value, either fed from an auto-update thread, or
 -- computed manually in the current thread.
@@ -106,62 +104,43 @@ instance Exception Replaced
 getCurrent :: UpdateSettings a
            -> IORef (Status a) -- ^ mutable state
            -> IO a
-getCurrent settings@UpdateSettings{..} istatus = do
-    ea <- atomicModifyIORef' istatus increment
-    case ea of
-        Return a -> return a
-        Manual   -> updateAction
-        Spawn    -> do
-            a <- updateAction
-            tid <- forkIO $ spawn settings istatus
-            join $ atomicModifyIORef' istatus $ turnToAuto a tid
-            return a
+getCurrent settings@UpdateSettings{..} istatus =
+    atomicModifyIORef' istatus change >>= switch
   where
-    increment (AutoUpdated a cnt tid) = (AutoUpdated a (succ cnt) tid, Return a)
-    increment (ManualUpdates i)       = (ManualUpdates (succ i),       act)
-      where
-        act = if i > updateSpawnThreshold then Spawn else Manual
+    change (ManualUpdates var cnt)
+      | cnt < updateSpawnThreshold   = (ManualUpdates var (cnt + 1), Manual)
+      | otherwise                    = (Spawning var, Spawn var)
+    change (Spawning var)            = (Spawning var, Wait var)
+    change (AutoUpdated var cnt cur) = (AutoUpdated var (cnt + 1) cur, Return cur)
 
-    -- Normal case.
-    turnToAuto a tid (ManualUpdates cnt)     = (AutoUpdated a cnt tid
-                                               ,return ())
-    -- Race condition: multiple threads were spawned.
-    -- So, let's kill the previous one by this thread.
-    turnToAuto a tid (AutoUpdated _ cnt old) = (AutoUpdated a cnt tid
-                                               ,throwTo old Replaced)
+    switch Manual       = updateAction
+    switch (Spawn var)  = do
+        new <- updateAction
+        atomically $ putTMVar var new
+        atomicModifyIORef' istatus $ \_ -> (AutoUpdated var 0 new, ())
+        void . forkIO $ spawn settings istatus
+        return new
+    switch (Wait var)   = atomically $ readTMVar var
+    switch (Return cur) = return cur
 
 spawn :: UpdateSettings a -> IORef (Status a) -> IO ()
-spawn UpdateSettings{..} istatus = handle (onErr istatus) $ forever $ do
-    threadDelay updateFreq
-    a <- updateAction
-    join $ atomicModifyIORef' istatus $ turnToManual a
+spawn UpdateSettings{..} istatus = loop `finally` cleanup
   where
+    loop = do
+        threadDelay updateFreq
+        new <- updateAction
+        var <- atomically newEmptyTMVar -- FIXME: this is wasteful.
+        again <- atomicModifyIORef' istatus $ change var new
+        when again loop
+
     -- Normal case.
-    turnToManual a (AutoUpdated _ cnt tid)
-      | cnt >= 1                     = (AutoUpdated a 0 tid, return ())
-      | otherwise                    = (ManualUpdates 0, stop)
+    change var new (AutoUpdated oldvar cnt _old)
+      | cnt >= 1                     = (AutoUpdated oldvar 0 new, True)
+      | otherwise                    = (ManualUpdates var 0, False)
     -- This case must not happen.
-    turnToManual _ (ManualUpdates i) =  assert False (ManualUpdates i, stop)
+    change _ _ (ManualUpdates cnt oldvar) = assert False (ManualUpdates cnt oldvar, False)
+    change var _ (Spawning _)             = assert False (ManualUpdates var 0, False)
 
-onErr :: IORef (Status a) -> SomeException -> IO ()
-onErr istatus ex = case fromException ex of
-    Just Replaced -> return () -- this thread is terminated
-    Nothing -> do
-        tid <- myThreadId
-        atomicModifyIORef' istatus $ clear tid
-        throwIO ex
-  where
-    -- In the race condition described above,
-    -- suppose thread A is running, and is killed by thread B.
-    -- Thread B then updates the IORef to refer to thread B.
-    -- Then thread A's exception handler fires.
-    -- We don't want to modify the IORef at all,
-    -- since it refers to thread B already.
-    -- Solution: only switch back to manual updates
-    -- if the IORef is pointing at the current thread.
-    clear tid (AutoUpdated _ _ tid') | tid == tid' = (ManualUpdates 0, ())
-    clear _   status                               = (status, ())
-
--- | Throw an error to kill a thread.
-stop :: IO a
-stop = throwIO Replaced
+    cleanup = do
+        var <- atomically newEmptyTMVar
+        atomicModifyIORef' istatus $ \_ -> (ManualUpdates var 0, ())
