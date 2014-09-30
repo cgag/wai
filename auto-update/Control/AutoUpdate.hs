@@ -1,5 +1,6 @@
 {-# LANGUAGE DeriveDataTypeable #-}
-{-# LANGUAGE RecordWildCards    #-}
+{-# LANGUAGE RecordWildCards #-}
+{-# LANGUAGE BangPatterns #-}
 
 -- | A common problem is the desire to have an action run at a scheduled
 -- interval, but only if it is needed. For example, instead of having
@@ -23,12 +24,13 @@ module Control.AutoUpdate (
     , mkAutoUpdate
     ) where
 
-import           Control.AutoUpdate.Util (atomicModifyIORef')
-import           Control.Concurrent (forkIO, threadDelay)
-import           Control.Exception  (assert, finally)
-import           Control.Monad      (void, when)
-import           Data.IORef         (IORef, newIORef, writeIORef)
-import           Control.Concurrent.STM
+import Control.AutoUpdate.Util (atomicModifyIORef')
+import Control.Concurrent (forkOn, threadDelay, myThreadId, getNumCapabilities, threadCapability)
+import Control.Concurrent.STM (TMVar, atomically, newEmptyTMVar, putTMVar, readTMVar)
+import Control.Exception (assert, finally)
+import Control.Monad (replicateM, void, when)
+import Data.Array (Array, (!), listArray)
+import Data.IORef (IORef, newIORef, writeIORef)
 
 -- | Default value for creating an @UpdateSettings@.
 --
@@ -80,15 +82,23 @@ data Status a = Manual (TMVar a) {-# UNPACK #-} !Int
               | Auto (TMVar a) {-# UNPACK #-} !Int !a
                 -- Int: Number of times used since last updated.
 
+type IStatus a = IORef (Status a)
+newtype IStatusSet a = IStatusSet (Array Int (IStatus a))
+
 -- | Generate an action which will either read from an automatically
 -- updated value, or run the update action in the current thread.
 --
 -- Since 0.1.0
 mkAutoUpdate :: UpdateSettings a -> IO (IO a)
 mkAutoUpdate us = do
-    var <- atomically newEmptyTMVar
-    istatus <- newIORef $ Manual var 0
-    return $! getCurrent us istatus
+    n <- getNumCapabilities
+    refs <- replicateM n newIStatus
+    let !istatusset = IStatusSet $ listArray (0,n-1) refs
+    return $! getCurrent us istatusset
+  where
+    newIStatus = do
+        var <- atomically newEmptyTMVar
+        newIORef (Manual var 0)
 
 data Action a = Perform | Spawn (TMVar a) | Wait (TMVar a) | Return a
 
@@ -97,10 +107,12 @@ data Action a = Perform | Spawn (TMVar a) | Wait (TMVar a) | Return a
 --
 -- Since 0.1.0
 getCurrent :: UpdateSettings a
-           -> IORef (Status a) -- ^ mutable state
+           -> IStatusSet a
            -> IO a
-getCurrent settings@UpdateSettings{..} istatus =
-    atomicModifyIORef' istatus change >>= switch
+getCurrent settings@UpdateSettings{..} (IStatusSet istatusset) = do
+    (i,_) <- myThreadId >>= threadCapability
+    let !istatus = istatusset ! i
+    atomicModifyIORef' istatus change >>= switch istatus i
   where
     change (Manual var cnt)
       | cnt < updateSpawnThreshold = (Manual var (cnt + 1), Perform)
@@ -108,23 +120,27 @@ getCurrent settings@UpdateSettings{..} istatus =
     change (Semi var)              = (Semi var, Wait var)
     change (Auto var cnt cur)      = (Auto var (cnt + 1) cur, Return cur)
 
-    switch Perform      = updateAction
-    switch (Spawn var)  = do
+    switch _       _ Perform     = updateAction
+    switch istatus i (Spawn var) = do
         new <- updateAction
-        atomically $ putTMVar var new
+        atomically $ putTMVar var new -- waking up threads in 'Wait'.
         writeIORef istatus (Auto var 0 new)
-        void . forkIO $ spawn settings istatus
+        void $ forkOn i (spawn settings istatus)
         return new
-    switch (Wait var)   = atomically $ readTMVar var
-    switch (Return cur) = return cur
+    -- If the thread to execute putTMVar, an error of dead lock
+    -- occurs. So, this does not wait forever.
+    switch _ _ (Wait var)        = atomically $ readTMVar var
+    switch _ _ (Return cur)      = return cur
 
-spawn :: UpdateSettings a -> IORef (Status a) -> IO ()
+spawn :: UpdateSettings a -> IStatus a -> IO ()
 spawn UpdateSettings{..} istatus = loop `finally` cleanup
   where
     loop = do
         threadDelay updateFreq
         new <- updateAction
-        var <- atomically newEmptyTMVar -- FIXME: this is wasteful.
+        -- FIXME: this is wasteful.
+        -- But this is necessary to avoid deadlock.
+        var <- atomically newEmptyTMVar
         again <- atomicModifyIORef' istatus $ change var new
         when again loop
 
