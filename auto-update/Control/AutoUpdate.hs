@@ -136,16 +136,17 @@ getCurrent settings@UpdateSettings{..} (IStatusSet istatusset) = do
     obtain _ _ (UseCache cur)    = return cur
 
 spawn :: UpdateSettings a -> IStatus a -> IO ()
-spawn UpdateSettings{..} istatus = loop `finally` cleanup istatus
+spawn UpdateSettings{..} istatus = loop Nothing `finally` cleanup istatus
   where
-    loop = do
+    loop mvar = do
         threadDelay updateFreq
         new <- updateAction
-        -- FIXME: this is wasteful.
-        -- But this is necessary to avoid deadlock.
-        var <- atomically newEmptyTMVar
+        -- Creating a new TMVar for dead lock detection.
+        var <- case mvar of
+            Just v  -> return v
+            Nothing -> atomically newEmptyTMVar
         again <- atomicModifyIORef' istatus $ change var new
-        when again loop
+        when again $ loop (Just var)
 
     -- Normal case.
     change var new (Auto oldvar cnt _old)
