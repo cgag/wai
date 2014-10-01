@@ -27,7 +27,7 @@ module Control.AutoUpdate (
 import Control.AutoUpdate.Util (atomicModifyIORef')
 import Control.Concurrent (forkOn, threadDelay, myThreadId, getNumCapabilities, threadCapability)
 import Control.Concurrent.STM (TMVar, atomically, newEmptyTMVar, putTMVar, readTMVar)
-import Control.Exception (assert, finally)
+import Control.Exception (assert, finally, onException, mask_)
 import Control.Monad (replicateM, void, when)
 import Data.Array (Array, (!), listArray)
 import Data.IORef (IORef, newIORef, writeIORef)
@@ -100,7 +100,7 @@ mkAutoUpdate us = do
         var <- atomically newEmptyTMVar
         newIORef (Manual var 0)
 
-data Action a = Perform | Spawn (TMVar a) | Wait (TMVar a) | Return a
+data Action a = Perform | Spawn (TMVar a) | Wait (TMVar a) | UseCache a
 
 -- | Get the current value, either fed from an auto-update thread, or
 -- computed manually in the current thread.
@@ -112,28 +112,31 @@ getCurrent :: UpdateSettings a
 getCurrent settings@UpdateSettings{..} (IStatusSet istatusset) = do
     (i,_) <- myThreadId >>= threadCapability
     let !istatus = istatusset ! i
-    atomicModifyIORef' istatus change >>= switch istatus i
+    changeAndObtain istatus i `onException` cleanup istatus
   where
+    changeAndObtain istatus i = mask_ $
+        atomicModifyIORef' istatus change >>= obtain istatus i
+
     change (Manual var cnt)
       | cnt < updateSpawnThreshold = (Manual var (cnt + 1), Perform)
       | otherwise                  = (Semi var, Spawn var)
     change (Semi var)              = (Semi var, Wait var)
-    change (Auto var cnt cur)      = (Auto var (cnt + 1) cur, Return cur)
+    change (Auto var cnt cur)      = (Auto var (cnt + 1) cur, UseCache cur)
 
-    switch _       _ Perform     = updateAction
-    switch istatus i (Spawn var) = do
+    obtain _ _ Perform           = updateAction
+    obtain istatus i (Spawn var) = do
         new <- updateAction
         atomically $ putTMVar var new -- waking up threads in 'Wait'.
         writeIORef istatus (Auto var 0 new)
         void $ forkOn i (spawn settings istatus)
         return new
-    -- If the thread to execute putTMVar, an error of dead lock
-    -- occurs. So, this does not wait forever.
-    switch _ _ (Wait var)        = atomically $ readTMVar var
-    switch _ _ (Return cur)      = return cur
+    -- If the thread to execute putTMVar dies without putTMVar,
+    -- an error of dead lock occurs. So, this does not wait forever.
+    obtain _ _ (Wait var)        = atomically $ readTMVar var
+    obtain _ _ (UseCache cur)    = return cur
 
 spawn :: UpdateSettings a -> IStatus a -> IO ()
-spawn UpdateSettings{..} istatus = loop `finally` cleanup
+spawn UpdateSettings{..} istatus = loop `finally` cleanup istatus
   where
     loop = do
         threadDelay updateFreq
@@ -149,9 +152,9 @@ spawn UpdateSettings{..} istatus = loop `finally` cleanup
       | cnt >= 1                   = (Auto oldvar 0 new, True)
       | otherwise                  = (Manual var 0, False)
     -- This case must not happen.
-    change _ _ (Manual cnt oldvar) = assert False (Manual cnt oldvar, False)
-    change var _ (Semi _)          = assert False (Manual var 0, False)
+    change var _ _                 = assert False (Manual var 0, False)
 
-    cleanup = do
+cleanup :: IStatus a -> IO ()
+cleanup istatus = do
         var <- atomically newEmptyTMVar
         writeIORef istatus $ Manual var 0
