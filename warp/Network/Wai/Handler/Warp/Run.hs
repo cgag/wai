@@ -16,7 +16,6 @@ import qualified Data.ByteString as S
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Streaming.Network (bindPortTCP)
 import Network (sClose, Socket)
-import qualified Network.HTTP.Types as H
 import Network.Socket (accept, withSocketsDo, SockAddr)
 import qualified Network.Socket.ByteString as Sock
 import Network.Wai
@@ -24,6 +23,7 @@ import Network.Wai.Handler.Warp.Buffer
 import Network.Wai.Handler.Warp.Counter
 import qualified Network.Wai.Handler.Warp.Date as D
 import qualified Network.Wai.Handler.Warp.FdCache as F
+import Network.Wai.Handler.Warp.HTTP2
 import Network.Wai.Handler.Warp.Header
 import Network.Wai.Handler.Warp.Recv
 import Network.Wai.Handler.Warp.Request
@@ -266,14 +266,6 @@ fork set mkConn addr app dc fc tm counter = void $ forkIOWithUnmask $ \unmask ->
     onClose adr _ = decrease counter >> settingsOnClose set adr
 
 data ConnStatus = Done | Upgrade deriving Eq
-
-isHTTP2 :: Request -> Bool
-isHTTP2 req = requestMethod req == "PRI" &&
-              rawPathInfo req == "*"     &&
-              httpVersion req == H.HttpVersion 2 0
-
-http2 :: Connection -> InternalInfo -> SockAddr -> Bool -> Settings -> Application -> IO ()
-http2 _ _ _ _ _ _ = putStrLn "OOOOOKKKKK" -- fixme
 
 serveConnection :: Connection
                 -> InternalInfo
