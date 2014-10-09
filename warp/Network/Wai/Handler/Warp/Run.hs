@@ -16,6 +16,7 @@ import qualified Data.ByteString as S
 import Data.IORef (IORef, newIORef, readIORef, writeIORef)
 import Data.Streaming.Network (bindPortTCP)
 import Network (sClose, Socket)
+import qualified Network.HTTP.Types as H
 import Network.Socket (accept, withSocketsDo, SockAddr)
 import qualified Network.Socket.ByteString as Sock
 import Network.Wai
@@ -264,6 +265,16 @@ fork set mkConn addr app dc fc tm counter = void $ forkIOWithUnmask $ \unmask ->
     onOpen adr    = increase counter >> settingsOnOpen  set adr
     onClose adr _ = decrease counter >> settingsOnClose set adr
 
+data ConnStatus = Done | Upgrade deriving Eq
+
+isHTTP2 :: Request -> Bool
+isHTTP2 req = requestMethod req == "PRI" &&
+              rawPathInfo req == "*"     &&
+              httpVersion req == H.HttpVersion 2 0
+
+http2 :: Connection -> InternalInfo -> SockAddr -> Bool -> Settings -> Application -> IO ()
+http2 _ _ _ _ _ _ = putStrLn "OOOOOKKKKK" -- fixme
+
 serveConnection :: Connection
                 -> InternalInfo
                 -> SockAddr
@@ -274,9 +285,10 @@ serveConnection :: Connection
 serveConnection conn ii addr isSecure' settings app = do
     istatus <- newIORef False
     src <- mkSource (connSource conn th istatus)
-    recvSendLoop istatus src `E.catch` \e -> do
+    st <- recvSendLoop istatus src `E.catch` \e -> do
         sendErrorResponse istatus e
         throwIO (e :: SomeException)
+    when (st == Upgrade) $ http2 conn ii addr isSecure' settings app
 
   where
     th = threadHandle ii
@@ -294,42 +306,49 @@ serveConnection conn ii addr isSecure' settings app = do
 
     recvSendLoop istatus fromClient = do
         (req', idxhdr) <- recvRequest settings conn ii addr fromClient
-        let req = req' { isSecure = isSecure' }
-        -- Let the application run for as long as it wants
-        T.pause th
+        if isHTTP2 req' then do
+            -- fixme: is this safe?
+            flushBody $ requestBody req'
+            return Upgrade
+          else do
+            let req = req' { isSecure = isSecure' }
+            -- Let the application run for as long as it wants
+            T.pause th
 
-        -- In the event that some scarce resource was acquired during
-        -- creating the request, we need to make sure that we don't get
-        -- an async exception before calling the ResponseSource.
-        keepAliveRef <- newIORef $ error "keepAliveRef not filled"
-        _ <- app req $ \res -> do
-            T.resume th
-            -- FIXME consider forcing evaluation of the res here to
-            -- send more meaningful error messages to the user.
-            -- However, it may affect performance.
-            writeIORef istatus False
-            keepAlive <- sendResponse
-                (settingsServerName settings)
-                conn ii req idxhdr (readSource fromClient) res
-            writeIORef keepAliveRef keepAlive
-            return ResponseReceived
-        keepAlive <- readIORef keepAliveRef
+            -- In the event that some scarce resource was acquired during
+            -- creating the request, we need to make sure that we don't get
+            -- an async exception before calling the ResponseSource.
+            keepAliveRef <- newIORef $ error "keepAliveRef not filled"
+            _ <- app req $ \res -> do
+                T.resume th
+                -- FIXME consider forcing evaluation of the res here to
+                -- send more meaningful error messages to the user.
+                -- However, it may affect performance.
+                writeIORef istatus False
+                keepAlive <- sendResponse
+                             (settingsServerName settings)
+                             conn ii req idxhdr (readSource fromClient) res
+                writeIORef keepAliveRef keepAlive
+                return ResponseReceived
+            keepAlive <- readIORef keepAliveRef
 
-        -- We just send a Response and it takes a time to
-        -- receive a Request again. If we immediately call recv,
-        -- it is likely to fail and the IO manager works.
-        -- It is very costy. So, we yield to another Haskell
-        -- thread hoping that the next Request will arraive
-        -- when this Haskell thread will be re-scheduled.
-        -- This improves performance at least when
-        -- the number of cores is small.
-        Conc.yield
+            -- We just send a Response and it takes a time to
+            -- receive a Request again. If we immediately call recv,
+            -- it is likely to fail and the IO manager works.
+            -- It is very costy. So, we yield to another Haskell
+            -- thread hoping that the next Request will arraive
+            -- when this Haskell thread will be re-scheduled.
+            -- This improves performance at least when
+            -- the number of cores is small.
+            Conc.yield
 
-        when keepAlive $ do
-            -- flush the rest of the request body
-            flushBody $ requestBody req
-            T.resume th
-            recvSendLoop istatus fromClient
+            if keepAlive then do
+                -- flush the rest of the request body
+                flushBody $ requestBody req
+                T.resume th
+                recvSendLoop istatus fromClient
+              else
+                return Done
 
 flushBody :: IO ByteString -> IO ()
 flushBody src =
