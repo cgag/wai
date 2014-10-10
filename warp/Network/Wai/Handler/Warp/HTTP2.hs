@@ -1,13 +1,13 @@
 {-# LANGUAGE OverloadedStrings #-}
 {-# LANGUAGE RecordWildCards #-}
 
-module Network.Wai.Handler.Warp.HTTP2 where
+module Network.Wai.Handler.Warp.HTTP2 (isHTTP2, http2) where
 
 import Blaze.ByteString.Builder
 import Control.Arrow (first)
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
-import Control.Monad (forever, unless, void)
+import Control.Monad (when, unless, void)
 import Data.Array.IO (IOUArray, newListArray)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
@@ -16,6 +16,7 @@ import Data.CaseInsensitive (foldedCase, mk)
 import Data.IORef (IORef, readIORef, newIORef, atomicModifyIORef', writeIORef)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as M
+import Data.Maybe (fromJust)
 import Data.Monoid (mempty)
 import qualified Network.HTTP.Types as H
 import Network.Socket (SockAddr)
@@ -27,18 +28,18 @@ import Network.Wai.Internal (Request(..), Response(..), ResponseReceived(..))
 
 import Network.HTTP2
 import Network.HPACK
-import Data.Maybe (fromJust)
 
 ----------------------------------------------------------------
 
-data Req = ReqH HeaderList
-         | ReqC ByteString
-         | ReqE ByteString
+data Req = ReqHead HeaderList
+         | ReqDatC ByteString
+         | ReqDatE ByteString
 
-data Rsp = RspH Int H.Status H.ResponseHeaders
-         | RspF Int (() -> IO ())
-         | RspC Int ByteString
-         | RspE Int ByteString
+data Rsp = RspHead Int H.Status H.ResponseHeaders
+         | RspFunc Int (() -> IO ())
+         | RspDatC Int ByteString
+         | RspDatE Int ByteString
+         | RspDone
 
 type ReqQueue = TQueue Req
 type RspQueue = TQueue Rsp
@@ -86,6 +87,7 @@ http2 conn ii addr isSecure' settings src app = do
 
 ----------------------------------------------------------------
 
+data Next = None | Done | Fork Int ReqQueue
 
 frameReader :: Context -> Connection -> InternalInfo -> SockAddr -> Bool -> S.Settings -> Source -> Application -> IO ()
 frameReader ctx@Context{..} conn ii addr isSecure' settings src app = do
@@ -97,11 +99,13 @@ frameReader ctx@Context{..} conn ii addr isSecure' settings src app = do
                 leftoverSource src bs'
                 x <- switch ctx frame
                 case x of
-                    Nothing        -> return ()
-                    Just (stid, q) -> void . forkIO $ reqReader stid q outputQ addr isSecure' settings app
-                frameReader ctx conn ii addr isSecure' settings src app
+                    Done -> return ()
+                    None -> frameReader ctx conn ii addr isSecure' settings src app
+                    Fork stid  q -> do
+                        void . forkIO $ reqReader stid q outputQ addr isSecure' settings app
+                        frameReader ctx conn ii addr isSecure' settings src app
 
-switch :: Context -> Frame -> IO (Maybe (Int, ReqQueue))
+switch :: Context -> Frame -> IO Next
 switch Context{..} Frame{ framePayload = HeadersFrame _ hdrblk,
                           frameHeader = FrameHeader{..} } = do
     hdrtbl <- readIORef decodeHeaderTable
@@ -115,8 +119,8 @@ switch Context{..} Frame{ framePayload = HeadersFrame _ hdrblk,
         Nothing -> do
             q <- newTQueueIO
             atomicModifyIORef' idTable $ \m -> (M.insert stid q m, ())
-            atomically $ writeTQueue q (ReqH hdr)
-            return $ Just (stid,q)
+            atomically $ writeTQueue q (ReqHead hdr)
+            return $ Fork stid q
 
 switch Context{..} Frame{ framePayload = DataFrame body,
                           frameHeader = FrameHeader{..} } = do
@@ -125,12 +129,18 @@ switch Context{..} Frame{ framePayload = DataFrame body,
     case M.lookup stid m of
         Nothing -> error "No such stream"
         Just q  -> do
-            let tag = if testEndStream flags then ReqE else ReqC
+            let tag = if testEndStream flags then ReqDatE else ReqDatC
             atomically $ writeTQueue q (tag body)
-            return Nothing
+            return None
 
 switch Context{..} Frame{ framePayload = SettingsFrame _,
-                          frameHeader = FrameHeader{..} } = return Nothing -- fixme
+                          frameHeader = FrameHeader{..} } = return None -- fixme
+
+-- fixme :: clean up should be more complex than this
+switch Context{..} Frame{ framePayload = GoAwayFrame _ _ _,
+                          frameHeader = FrameHeader{..} } = do
+    atomically $ writeTQueue outputQ RspDone
+    return Done
 {-
 -- resetting
 switch Context{..} (RSTStreamFrame _)     = undefined
@@ -143,10 +153,13 @@ switch Context{..} (GoAwayFrame _ _ _)    = undefined
 switch Context{..} (PriorityFrame _)      = undefined
 switch Context{..} (WindowUpdateFrame _)  = undefined
 switch Context{..} (PushPromiseFrame _ _) = undefined
-switch Context{..} (UnknownFrame _ _)    = undefined
+switch Context{..} (UnknownFrame _ _)     = undefined
 switch Context{..} (ContinuationFrame _)  = undefined
 -}
-switch _ _ = undefined
+switch _ Frame{..} = do
+    putStrLn "switch"
+    print $ toFrameTypeId $ framePayloadToFrameType framePayload
+    return None
 
 ----------------------------------------------------------------
 
@@ -156,9 +169,10 @@ reqReader :: Int -> ReqQueue -> RspQueue ->  SockAddr -> Bool -> S.Settings -> A
 reqReader stid inpq outq addr isSecure' settings app = do
     frag <- atomically $ readTQueue inpq
     case frag of
-        ReqC _   -> error "ReqC"
-        ReqE _   -> error "ReqE"
-        ReqH hdr -> do
+        ReqDatC _   -> error "ReqDatC"
+        ReqDatE _   -> error "ReqDatE"
+        ReqHead hdr -> do
+            -- fixme: fromJust -> protocl error?
             let (unparsedPath,query) = B8.break (=='?') $ fromJust $ lookup ":path" hdr -- fixme
                 path = H.extractPath unparsedPath
             let req = Request {
@@ -180,13 +194,15 @@ reqReader stid inpq outq addr isSecure' settings app = do
             void $ app req enqueue
  where
    enqueue (ResponseBuilder st hdr bb) = do
-       let h = RspH stid st hdr
+       let h = RspHead stid st hdr
        atomically $ writeTQueue outq h
-       let d = RspE stid (toByteString bb) -- fixme
+       let d = RspDatE stid (toByteString bb) -- fixme
        atomically $ writeTQueue outq d
        return ResponseReceived
 
-   enqueue _ = undefined -- fixme
+   enqueue _ = do -- fixme
+       putStrLn "enqueue"
+       return ResponseReceived
 
 {-
 ResponseFile Status ResponseHeaders FilePath (Maybe FilePart)
@@ -200,27 +216,35 @@ ResponseRaw (IO ByteString -> (ByteString -> IO ()) -> IO ()) Response
 -- * Packing Frames to bytestream
 -- * Sending bytestream
 frameSender :: Connection -> Context -> IO ()
-frameSender Connection{..} Context{..} = forever $ do
-    rsp <- atomically $ readTQueue outputQ
-    case rsp of
-        RspH stid st hdr -> do
-            let status = B8.pack $ show $ H.statusCode st
-                hdr' = (":status", status) : map (first foldedCase) hdr
-            -- addServer
-            -- addDate
-            ehdrtbl <- readIORef encodeHeaderTable
-            (ehdrtbl',hdrfrg) <- encodeHeader defaultEncodeStrategy ehdrtbl hdr'
-            writeIORef encodeHeaderTable ehdrtbl'
-            -- fixme endHeader
-            let einfo = EncodeInfo (setEndHeader 0) (toStreamIdentifier stid) Nothing
-                frame = HeadersFrame Nothing hdrfrg
-                bytestream = encodeFrame einfo frame
-            putStrLn "RspH"
-            toBufIOWith connWriteBuffer connBufferSize connSendAll (fromByteString bytestream)
-        RspE stid dat -> do
-            let einfo = EncodeInfo (setEndStream 0) (toStreamIdentifier stid) Nothing
-                frame = DataFrame dat
-                bytestream = encodeFrame einfo frame
-            putStrLn "RspE"
-            toBufIOWith connWriteBuffer connBufferSize connSendAll (fromByteString bytestream)
-        _ -> undefined
+frameSender Connection{..} Context{..} = loop
+  where
+    loop = do
+        cont <- readQ >>= fill
+        when cont loop
+    readQ = atomically $ readTQueue outputQ
+    fill (RspHead stid st hdr) = do
+        let status = B8.pack $ show $ H.statusCode st
+            hdr' = (":status", status) : map (first foldedCase) hdr
+        -- addServer
+        -- addDate
+        ehdrtbl <- readIORef encodeHeaderTable
+        (ehdrtbl',hdrfrg) <- encodeHeader defaultEncodeStrategy ehdrtbl hdr'
+        writeIORef encodeHeaderTable ehdrtbl'
+        -- fixme endHeader
+        let einfo = EncodeInfo (setEndHeader 0) (toStreamIdentifier stid) Nothing
+            frame = HeadersFrame Nothing hdrfrg
+            bytestream = encodeFrame einfo frame
+        putStrLn "RspHead"
+        toBufIOWith connWriteBuffer connBufferSize connSendAll (fromByteString bytestream)
+        return True
+
+    fill (RspDatE stid dat) = do
+        let einfo = EncodeInfo (setEndStream 0) (toStreamIdentifier stid) Nothing
+            frame = DataFrame dat
+            bytestream = encodeFrame einfo frame
+        putStrLn "RspDatE"
+        toBufIOWith connWriteBuffer connBufferSize connSendAll (fromByteString bytestream)
+        return True
+
+    fill RspDone = return False
+    fill _ = do putStrLn "frameSender" >> return True
