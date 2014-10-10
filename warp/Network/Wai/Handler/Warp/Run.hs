@@ -299,8 +299,7 @@ serveConnection conn ii addr isSecure' settings app = do
     recvSendLoop istatus fromClient = do
         (req', idxhdr) <- recvRequest settings conn ii addr fromClient
         if isHTTP2 req' then do
-            x <- headerLines fromClient -- fixme: consuming "SM\r\n\r\n"
-            print x
+            _ <- headerLines fromClient -- fixme: consuming "SM\r\n\r\n"
             return Upgrade
           else do
             let req = req' { isSecure = isSecure' }
