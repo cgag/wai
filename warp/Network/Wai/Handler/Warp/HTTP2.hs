@@ -231,7 +231,7 @@ frameSender Connection{..} Context{..} = loop
         (ehdrtbl',hdrfrg) <- encodeHeader defaultEncodeStrategy ehdrtbl hdr'
         writeIORef encodeHeaderTable ehdrtbl'
         -- fixme endHeader
-        let einfo = EncodeInfo (setEndHeader 0) (toStreamIdentifier stid) Nothing
+        let einfo = EncodeInfo (setEndHeader defaultFlags) (toStreamIdentifier stid) Nothing
             frame = HeadersFrame Nothing hdrfrg
             bytestream = encodeFrame einfo frame
         putStrLn "RspHead"
@@ -239,7 +239,7 @@ frameSender Connection{..} Context{..} = loop
         return True
 
     fill (RspDatE stid dat) = do
-        let einfo = EncodeInfo (setEndStream 0) (toStreamIdentifier stid) Nothing
+        let einfo = EncodeInfo (setEndStream defaultFlags) (toStreamIdentifier stid) Nothing
             frame = DataFrame dat
             bytestream = encodeFrame einfo frame
         putStrLn "RspDatE"
