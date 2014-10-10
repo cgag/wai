@@ -280,7 +280,7 @@ serveConnection conn ii addr isSecure' settings app = do
     st <- recvSendLoop istatus src `E.catch` \e -> do
         sendErrorResponse istatus e
         throwIO (e :: SomeException)
-    when (st == Upgrade) $ http2 conn ii addr isSecure' src app
+    when (st == Upgrade) $ http2 conn ii addr isSecure' settings src app
 
   where
     th = threadHandle ii

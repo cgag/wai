@@ -27,6 +27,7 @@ import Network.Wai.Internal (Request(..), Response(..), ResponseReceived(..))
 
 import Network.HTTP2
 import Network.HPACK
+import Data.Maybe (fromJust)
 
 ----------------------------------------------------------------
 
@@ -77,28 +78,32 @@ isHTTP2 req = requestMethod req == "PRI" &&
 
 ----------------------------------------------------------------
 -- fixme: Settings
-http2 :: Connection -> InternalInfo -> SockAddr -> Bool -> Source -> Application -> IO ()
-http2 conn _ii _addr _isSecure' src app = do
+http2 :: Connection -> InternalInfo -> SockAddr -> Bool -> S.Settings -> Source -> Application -> IO ()
+http2 conn ii addr isSecure' settings src app = do
     ctx <- newContext
-    void . forkIO $ frameReader ctx src app
+    void . forkIO $ frameReader ctx conn ii addr isSecure' settings src app
     frameSender conn ctx
 
 ----------------------------------------------------------------
 
-frameReader :: Context -> Source -> Application -> IO ()
-frameReader ctx src app = do
+
+frameReader :: Context -> Connection -> InternalInfo -> SockAddr -> Bool -> S.Settings -> Source -> Application -> IO ()
+frameReader ctx@Context{..} conn ii addr isSecure' settings src app = do
     bs <- readSource src
     unless (BS.null bs) $ do
         case decodeFrame defaultSettings bs of
             Left x            -> error (show x) -- fixme
             Right (frame,bs') -> do
                 leftoverSource src bs'
-                switch ctx frame app
-                frameReader ctx src app
+                x <- switch ctx frame
+                case x of
+                    Nothing        -> return ()
+                    Just (stid, q) -> void . forkIO $ reqReader stid q outputQ addr isSecure' settings app
+                frameReader ctx conn ii addr isSecure' settings src app
 
-switch :: Context -> Frame -> Application -> IO ()
+switch :: Context -> Frame -> IO (Maybe (Int, ReqQueue))
 switch Context{..} Frame{ framePayload = HeadersFrame _ hdrblk,
-                          frameHeader = FrameHeader{..} } app = do
+                          frameHeader = FrameHeader{..} } = do
     hdrtbl <- readIORef decodeHeaderTable
     (hdrtbl', hdr) <- decodeHeader hdrtbl hdrblk
     writeIORef decodeHeaderTable hdrtbl'
@@ -109,22 +114,23 @@ switch Context{..} Frame{ framePayload = HeadersFrame _ hdrblk,
         Just _  -> error "bad header frame"
         Nothing -> do
             q <- newTQueueIO
-            atomicModifyIORef' idTable$ \m -> (M.insert stid q m, ())
+            atomicModifyIORef' idTable $ \m -> (M.insert stid q m, ())
             atomically $ writeTQueue q (ReqH hdr)
-            void . forkIO $ reqReader stid q outputQ app
+            return $ Just (stid,q)
 
 switch Context{..} Frame{ framePayload = DataFrame body,
-                          frameHeader = FrameHeader{..} } _ = do
+                          frameHeader = FrameHeader{..} } = do
     m <- readIORef idTable
-    let stid = fromIntegral $ fromStreamIdentifier streamId
+    let stid = fromStreamIdentifier streamId
     case M.lookup stid m of
         Nothing -> error "No such stream"
         Just q  -> do
             let tag = if testEndStream flags then ReqE else ReqC
             atomically $ writeTQueue q (tag body)
+            return Nothing
 
 switch Context{..} Frame{ framePayload = SettingsFrame _,
-                          frameHeader = FrameHeader{..} } _ = return () -- fixme
+                          frameHeader = FrameHeader{..} } = return Nothing -- fixme
 {-
 -- resetting
 switch Context{..} (RSTStreamFrame _)     = undefined
@@ -140,40 +146,36 @@ switch Context{..} (PushPromiseFrame _ _) = undefined
 switch Context{..} (UnknownFrame _ _)    = undefined
 switch Context{..} (ContinuationFrame _)  = undefined
 -}
-switch _ _ _ = undefined
+switch _ _ = undefined
 
 ----------------------------------------------------------------
 
--- removing id from idTable?
+-- FIXME: removing id from idTable?
 -- timeout?
-reqReader :: Int -> ReqQueue -> RspQueue -> Application -> IO ()
-reqReader stid inpq outq app = do
+reqReader :: Int -> ReqQueue -> RspQueue ->  SockAddr -> Bool -> S.Settings -> Application -> IO ()
+reqReader stid inpq outq addr isSecure' settings app = do
     frag <- atomically $ readTQueue inpq
     case frag of
         ReqC _   -> error "ReqC"
         ReqE _   -> error "ReqE"
         ReqH hdr -> do
-            let st = undefined
-                query = undefined
-                unparsedPath = undefined
-                path = undefined
-                settings = undefined
-                addr = undefined
+            let (unparsedPath,query) = B8.break (=='?') $ fromJust $ lookup ":path" hdr -- fixme
+                path = H.extractPath unparsedPath
             let req = Request {
-                    requestMethod = undefined -- fixme :method
+                    requestMethod = fromJust $ lookup ":method" hdr -- fixme
                   , httpVersion = http2ver
                   , rawPathInfo = if S.settingsNoParsePath settings then unparsedPath else path
                   , pathInfo = H.decodePathSegments path
                   , rawQueryString = query
                   , queryString = H.parseQuery query
                   , requestHeaders = map (first mk) hdr -- fixme: removing ":foo"
-                  , isSecure = False -- fixtme
+                  , isSecure = isSecure'
                   , remoteHost = addr
                   , requestBody = undefined -- from fragments
                   , vault = mempty
                   , requestBodyLength = ChunkedBody -- fixme
-                  , requestHeaderHost = undefined -- fixme :authority
-                  , requestHeaderRange = undefined -- fixme:
+                  , requestHeaderHost = lookup ":authority" hdr
+                  , requestHeaderRange = lookup "range" hdr
                   }
             void $ app req enqueue
  where
