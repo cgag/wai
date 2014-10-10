@@ -280,7 +280,7 @@ serveConnection conn ii addr isSecure' settings app = do
     st <- recvSendLoop istatus src `E.catch` \e -> do
         sendErrorResponse istatus e
         throwIO (e :: SomeException)
-    when (st == Upgrade) $ http2 conn ii addr isSecure' settings app
+    when (st == Upgrade) $ http2 conn ii addr isSecure' src app
 
   where
     th = threadHandle ii
@@ -299,8 +299,8 @@ serveConnection conn ii addr isSecure' settings app = do
     recvSendLoop istatus fromClient = do
         (req', idxhdr) <- recvRequest settings conn ii addr fromClient
         if isHTTP2 req' then do
-            -- fixme: is this safe?
-            flushBody $ requestBody req'
+            x <- headerLines fromClient -- fixme: consuming "SM\r\n\r\n"
+            print x
             return Upgrade
           else do
             let req = req' { isSecure = isSecure' }
