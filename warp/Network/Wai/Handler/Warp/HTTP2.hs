@@ -7,12 +7,12 @@ import Blaze.ByteString.Builder
 import Control.Arrow (first)
 import Control.Concurrent (forkIO)
 import Control.Concurrent.STM
-import Control.Monad (unless, void)
+import Control.Monad (forever, unless, void)
 import Data.Array.IO (IOUArray, newListArray)
 import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
-import Data.CaseInsensitive (foldedCase)
+import Data.CaseInsensitive (foldedCase, mk)
 import Data.IORef (IORef, readIORef, newIORef, atomicModifyIORef', writeIORef)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as M
@@ -27,23 +27,8 @@ import Network.Wai.Internal (Request(..), Response(..), ResponseReceived(..))
 
 import Network.HTTP2
 import Network.HPACK
-import Control.Monad (forever)
 
-
-http2ver :: H.HttpVersion
-http2ver = H.HttpVersion 2 0
-
-isHTTP2 :: Request -> Bool
-isHTTP2 req = requestMethod req == "PRI" &&
-              rawPathInfo req == "*"     &&
-              httpVersion req == http2ver
-
--- fixme: Settings
-http2 :: Connection -> InternalInfo -> SockAddr -> Bool -> Source -> Application -> IO ()
-http2 conn _ii _addr _isSecure' src app = do
-    ctx <- newContext
-    void . forkIO $ frameReader ctx src app
-    frameSender conn ctx
+----------------------------------------------------------------
 
 data Req = ReqH HeaderList
          | ReqC ByteString
@@ -65,6 +50,8 @@ data Context = Context {
   , decodeHeaderTable :: IORef HeaderTable
   }
 
+----------------------------------------------------------------
+
 newContext :: IO Context
 newContext = do
     st <- newDefaultHttp2Settings
@@ -77,6 +64,26 @@ newContext = do
 -- fixme :: 1,6
 newDefaultHttp2Settings :: IO (IOUArray Int Int)
 newDefaultHttp2Settings = newListArray (1,6) [4096,1,-1,65535,16384,-1]
+
+----------------------------------------------------------------
+
+http2ver :: H.HttpVersion
+http2ver = H.HttpVersion 2 0
+
+isHTTP2 :: Request -> Bool
+isHTTP2 req = requestMethod req == "PRI" &&
+              rawPathInfo req == "*"     &&
+              httpVersion req == http2ver
+
+----------------------------------------------------------------
+-- fixme: Settings
+http2 :: Connection -> InternalInfo -> SockAddr -> Bool -> Source -> Application -> IO ()
+http2 conn _ii _addr _isSecure' src app = do
+    ctx <- newContext
+    void . forkIO $ frameReader ctx src app
+    frameSender conn ctx
+
+----------------------------------------------------------------
 
 frameReader :: Context -> Source -> Application -> IO ()
 frameReader ctx src app = do
@@ -135,6 +142,8 @@ switch Context{..} (ContinuationFrame _)  = undefined
 -}
 switch _ _ _ = undefined
 
+----------------------------------------------------------------
+
 -- removing id from idTable?
 -- timeout?
 reqReader :: Int -> ReqQueue -> RspQueue -> Application -> IO ()
@@ -157,7 +166,7 @@ reqReader stid inpq outq app = do
                   , pathInfo = H.decodePathSegments path
                   , rawQueryString = query
                   , queryString = H.parseQuery query
-                  , requestHeaders = undefined -- from hdr
+                  , requestHeaders = map (first mk) hdr -- fixme: removing ":foo"
                   , isSecure = False -- fixtme
                   , remoteHost = addr
                   , requestBody = undefined -- from fragments
@@ -175,7 +184,16 @@ reqReader stid inpq outq app = do
        atomically $ writeTQueue outq d
        return ResponseReceived
 
-   enqueue _ = undefined
+   enqueue _ = undefined -- fixme
+
+{-
+ResponseFile Status ResponseHeaders FilePath (Maybe FilePart)
+ResponseBuilder Status ResponseHeaders Builder
+ResponseStream Status ResponseHeaders StreamingBody
+ResponseRaw (IO ByteString -> (ByteString -> IO ()) -> IO ()) Response
+-}
+
+----------------------------------------------------------------
 
 -- * Packing Frames to bytestream
 -- * Sending bytestream
@@ -186,6 +204,8 @@ frameSender Connection{..} Context{..} = forever $ do
         RspH stid st hdr -> do
             let status = B8.pack $ show $ H.statusCode st
                 hdr' = (":status", status) : map (first foldedCase) hdr
+            -- addServer
+            -- addDate
             ehdrtbl <- readIORef encodeHeaderTable
             (ehdrtbl',hdrfrg) <- encodeHeader defaultEncodeStrategy ehdrtbl hdr'
             writeIORef encodeHeaderTable ehdrtbl'
@@ -202,27 +222,3 @@ frameSender Connection{..} Context{..} = forever $ do
             putStrLn "RspE"
             toBufIOWith connWriteBuffer connBufferSize connSendAll (fromByteString bytestream)
         _ -> undefined
-
-{-
-    case r of
-        ResponseFile _ _ _ _  -> putStrLn "ResponseFile"
-        ResponseBuilder st hdr bodyBuilder -> do
-            let status = B8.pack $ show $ H.statusCode st
-                hdr' = (":status", status) : map (first foldedCase) hdr
-            ehdrtbl <- readIORef encodeHeaderTable
-            (ehdrtbl',hdrblk) <- encodeHeader defaultEncodeStrategy ehdrtbl hdr'
-            let hdrframe = HeadersFrame Nothing hdrblk
-                bodyframe = DataFrame (toByteString bodyBuilder)
-            return ()
-        ResponseStream _ _ _  -> putStrLn "ResponseStream"
-        ResponseRaw _ _       -> putStrLn "ResponseRaw"
--}
--- Status -> :status
--- addServer
--- addDate
-{-
-ResponseFile Status ResponseHeaders FilePath (Maybe FilePart)
-ResponseBuilder Status ResponseHeaders Builder
-ResponseStream Status ResponseHeaders StreamingBody
-ResponseRaw (IO ByteString -> (ByteString -> IO ()) -> IO ()) Response
--}
