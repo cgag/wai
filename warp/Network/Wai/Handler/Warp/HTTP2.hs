@@ -13,7 +13,7 @@ import Data.ByteString (ByteString)
 import qualified Data.ByteString as BS
 import qualified Data.ByteString.Char8 as B8
 import Data.CaseInsensitive (foldedCase, mk)
-import Data.IORef (IORef, readIORef, newIORef, atomicModifyIORef', writeIORef)
+import Data.IORef (IORef, readIORef, newIORef, writeIORef, modifyIORef)
 import Data.IntMap (IntMap)
 import qualified Data.IntMap as M
 import Data.Maybe (fromJust)
@@ -46,7 +46,8 @@ type RspQueue = TQueue Rsp
 
 data Context = Context {
     http2Settings :: IOUArray Int Int
-  , idTable :: IORef (IntMap ReqQueue) -- fixme: heavy contention
+  -- fixme: clean up for frames whose end stream do not arrive
+  , idTable :: IORef (IntMap ReqQueue)
   , outputQ :: RspQueue
   , encodeHeaderTable :: IORef HeaderTable
   , decodeHeaderTable :: IORef HeaderTable
@@ -113,24 +114,28 @@ switch Context{..} Frame{ framePayload = HeadersFrame _ hdrblk,
     writeIORef decodeHeaderTable hdrtbl'
     m0 <- readIORef idTable
     let stid = fromStreamIdentifier streamId
-    -- fixme: need to testEndHeader
     case M.lookup stid m0 of
         Just _  -> error "bad header frame"
         Nothing -> do
+            let end = testEndStream flags
             q <- newTQueueIO
-            atomicModifyIORef' idTable $ \m -> (M.insert stid q m, ())
+            unless end $ modifyIORef idTable $ \m -> M.insert stid q m
+            -- fixme: need to testEndHeader. ContinuationFrame is not
+            -- support yet.
             atomically $ writeTQueue q (ReqHead hdr)
             return $ Fork stid q
 
 switch Context{..} Frame{ framePayload = DataFrame body,
                           frameHeader = FrameHeader{..} } = do
-    m <- readIORef idTable
+    m0 <- readIORef idTable
     let stid = fromStreamIdentifier streamId
-    case M.lookup stid m of
+    case M.lookup stid m0 of
         Nothing -> error "No such stream"
         Just q  -> do
-            let tag = if testEndStream flags then ReqDatE else ReqDatC
+            let end = testEndStream flags
+                tag = if end then ReqDatE else ReqDatC
             atomically $ writeTQueue q (tag body)
+            when end $ modifyIORef idTable $ \m -> M.delete stid m
             return None
 
 switch Context{..} Frame{ framePayload = SettingsFrame _,
