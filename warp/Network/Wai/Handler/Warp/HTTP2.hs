@@ -21,8 +21,10 @@ import Data.Monoid (mempty)
 import qualified Network.HTTP.Types as H
 import Network.Socket (SockAddr)
 import Network.Wai
+import Network.Wai.Handler.Warp.Header
 import Network.Wai.Handler.Warp.IO
-import qualified Network.Wai.Handler.Warp.Settings as S (Settings, settingsNoParsePath)
+import Network.Wai.Handler.Warp.Response
+import qualified Network.Wai.Handler.Warp.Settings as S (Settings, settingsNoParsePath, settingsServerName)
 import Network.Wai.Handler.Warp.Types
 import Network.Wai.Internal (Request(..), Response(..), ResponseReceived(..))
 
@@ -84,7 +86,7 @@ http2 :: Connection -> InternalInfo -> SockAddr -> Bool -> S.Settings -> Source 
 http2 conn ii addr isSecure' settings src app = do
     ctx <- newContext
     void . forkIO $ frameReader ctx conn ii addr isSecure' settings src app
-    frameSender conn ctx
+    frameSender conn ii settings ctx
 
 ----------------------------------------------------------------
 
@@ -220,20 +222,23 @@ ResponseRaw (IO ByteString -> (ByteString -> IO ()) -> IO ()) Response
 
 -- * Packing Frames to bytestream
 -- * Sending bytestream
-frameSender :: Connection -> Context -> IO ()
-frameSender Connection{..} Context{..} = loop
+frameSender :: Connection -> InternalInfo -> S.Settings -> Context -> IO ()
+frameSender Connection{..} ii settings Context{..} = loop
   where
     loop = do
         cont <- readQ >>= fill
         when cont loop
     readQ = atomically $ readTQueue outputQ
-    fill (RspHead stid st hdr) = do
+    fill (RspHead stid st hdr0) = do
+        let dc = dateCacher ii
+            rspidxhdr = indexResponseHeader hdr0
+            defServer = S.settingsServerName settings
+            addServerAndDate = addDate dc rspidxhdr . addServer defServer rspidxhdr
+        hdr1 <- addServerAndDate hdr0
         let status = B8.pack $ show $ H.statusCode st
-            hdr' = (":status", status) : map (first foldedCase) hdr
-        -- addServer
-        -- addDate
+            hdr2 = (":status", status) : map (first foldedCase) hdr1
         ehdrtbl <- readIORef encodeHeaderTable
-        (ehdrtbl',hdrfrg) <- encodeHeader defaultEncodeStrategy ehdrtbl hdr'
+        (ehdrtbl',hdrfrg) <- encodeHeader defaultEncodeStrategy ehdrtbl hdr2
         writeIORef encodeHeaderTable ehdrtbl'
         -- fixme endHeader
         let einfo = EncodeInfo (setEndHeader defaultFlags) (toStreamIdentifier stid) Nothing
