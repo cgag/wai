@@ -81,7 +81,7 @@ isHTTP2 req = requestMethod req == "PRI" &&
               httpVersion req == http2ver
 
 ----------------------------------------------------------------
--- fixme: Settings
+
 http2 :: Connection -> InternalInfo -> SockAddr -> Bool -> S.Settings -> Source -> Application -> IO ()
 http2 conn ii addr isSecure' settings src app = do
     ctx <- newContext
@@ -170,8 +170,6 @@ switch _ Frame{..} = do
 
 ----------------------------------------------------------------
 
--- FIXME: removing id from idTable?
--- timeout?
 reqReader :: Int -> ReqQueue -> RspQueue ->  SockAddr -> Bool -> S.Settings -> Application -> IO ()
 reqReader stid inpq outq addr isSecure' settings app = do
     frag <- atomically $ readTQueue inpq
